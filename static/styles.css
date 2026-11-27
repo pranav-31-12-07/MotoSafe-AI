@@ -1,0 +1,523 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #101419;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+  user-select: none;
+  color: #f4f7fa;
+}
+
+#app {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#simCanvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* TOP-LEFT ON / OFF IGNITION SWITCH */
+.hud-top-left {
+  position: absolute;
+  top: 20px;
+  left: 22px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.power-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 22px 10px 14px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  background: rgba(12, 18, 26, 0.78);
+  backdrop-filter: blur(10px);
+  color: #ffffff;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.38);
+  transition: transform 0.15s ease, border-color 0.25s ease, background 0.25s ease, box-shadow 0.25s ease;
+}
+
+.power-btn:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+.power-btn.is-on {
+  border-color: #2ce68a;
+  background: rgba(10, 36, 28, 0.85);
+  box-shadow: 0 0 24px rgba(44, 230, 138, 0.35);
+}
+
+.power-btn.is-off {
+  border-color: rgba(255, 92, 92, 0.75);
+}
+
+.dwell-ring {
+  width: 34px;
+  height: 34px;
+  transform: rotate(-90deg);
+}
+
+.dwell-track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.16);
+  stroke-width: 5;
+}
+
+.dwell-arc {
+  fill: none;
+  stroke: #22e6ff;
+  stroke-width: 5;
+  stroke-linecap: round;
+  stroke-dasharray: 175.93;
+  stroke-dashoffset: 175.93;
+  transition: stroke-dashoffset 0.06s linear;
+}
+
+.power-dot {
+  position: absolute;
+  left: 25px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ff4d4d;
+  box-shadow: 0 0 10px #ff4d4d;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.power-btn.is-on .power-dot {
+  background: #2ce68a;
+  box-shadow: 0 0 12px #2ce68a;
+}
+
+.power-text-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.05;
+}
+
+.power-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: rgba(210, 224, 236, 0.78);
+  font-weight: 700;
+}
+
+.power-state {
+  font-family: "Orbitron", monospace;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.index-hint {
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 11px;
+  background: rgba(12, 18, 26, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #cfe4f5;
+  backdrop-filter: blur(6px);
+}
+
+.cam-pill {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: rgba(12, 18, 26, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #8fd9f5;
+}
+
+.demo-panel {
+  margin-top: 4px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(10, 15, 22, 0.82);
+  border: 1px solid rgba(34, 230, 255, 0.3);
+  backdrop-filter: blur(10px);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-width: 280px;
+}
+
+.demo-panel.hidden {
+  display: none;
+}
+
+.demo-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #79e2f5;
+  font-weight: 700;
+}
+
+.demo-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.demo-btn {
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: #eef5fb;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.demo-btn:hover {
+  background: rgba(34, 230, 255, 0.22);
+  border-color: #22e6ff;
+}
+
+.demo-btn-primary {
+  background: rgba(0, 180, 230, 0.28);
+  border-color: #22e6ff;
+}
+
+/* INDEX-FINGER AIR CURSOR */
+.index-cursor {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 48px;
+  height: 48px;
+  margin-left: -24px;
+  margin-top: -24px;
+  pointer-events: none;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.14s ease, transform 0.08s ease;
+}
+
+.index-cursor.hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.cursor-svg {
+  width: 48px;
+  height: 48px;
+  transform: rotate(-90deg);
+  filter: drop-shadow(0 0 8px rgba(34, 230, 255, 0.8));
+}
+
+.cursor-track {
+  fill: rgba(10, 22, 34, 0.35);
+  stroke: rgba(34, 230, 255, 0.45);
+  stroke-width: 2.5;
+}
+
+.cursor-arc {
+  fill: none;
+  stroke: #3ef09b;
+  stroke-width: 3.5;
+  stroke-linecap: round;
+  stroke-dasharray: 119.38;
+  stroke-dashoffset: 119.38;
+}
+
+.cursor-dot {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #22e6ff;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 12px #22e6ff;
+}
+
+.cursor-tag {
+  position: absolute;
+  top: 48px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(10, 18, 28, 0.85);
+  border: 1px solid rgba(34, 230, 255, 0.55);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #7eeeff;
+}
+
+.power-btn.is-hovered {
+  transform: scale(1.06);
+  border-color: #22e6ff;
+  box-shadow: 0 0 28px rgba(34, 230, 255, 0.58);
+}
+
+/* TOP-CENTER HELMET SAFETY BANNER & 10-MIN COMPLIANCE SCAN */
+.top-center-stack {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: min(600px, calc(100vw - 440px));
+}
+
+.helmet-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 22px;
+  border-radius: 14px;
+  backdrop-filter: blur(10px);
+  border: 2px solid transparent;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.36);
+  transition: background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+  width: 100%;
+}
+
+.scan-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scan-timer-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 13px;
+  border-radius: 999px;
+  background: rgba(12, 18, 26, 0.78);
+  border: 1px solid rgba(34, 230, 255, 0.35);
+  backdrop-filter: blur(8px);
+  font-family: "Orbitron", monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #bceeff;
+}
+
+.scan-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22e6ff;
+  box-shadow: 0 0 8px #22e6ff;
+}
+
+.demo-speed-btn {
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(16, 24, 34, 0.78);
+  color: #dce9f5;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition: background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.demo-speed-btn:hover {
+  border-color: #22e6ff;
+}
+
+.demo-speed-btn.is-active {
+  background: rgba(255, 165, 20, 0.25);
+  border-color: #ffb020;
+  color: #ffd479;
+  box-shadow: 0 0 14px rgba(255, 176, 32, 0.42);
+}
+
+.helmet-banner.status-danger {
+  background: rgba(145, 18, 24, 0.88);
+  border-color: #ff5b5b;
+  animation: pulseWarn 1.4s ease-in-out infinite;
+}
+
+.helmet-banner.status-safe {
+  background: rgba(11, 95, 56, 0.86);
+  border-color: #2ce68a;
+  box-shadow: 0 0 26px rgba(44, 230, 138, 0.34);
+}
+
+@keyframes pulseWarn {
+  0%, 100% {
+    box-shadow: 0 0 16px rgba(255, 70, 70, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 30px rgba(255, 90, 60, 0.85);
+  }
+}
+
+.banner-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.banner-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.banner-title {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: #ffffff;
+}
+
+.banner-sub {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: rgba(242, 248, 255, 0.88);
+}
+
+/* TOP-RIGHT CIRCULAR WEBCAM PIP (Matching Reference.png) */
+.pip-wrapper {
+  position: absolute;
+  top: 18px;
+  right: 22px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.pip-circle {
+  width: 182px;
+  height: 182px;
+  border-radius: 50%;
+  border: 4px solid rgba(255, 255, 255, 0.94);
+  overflow: hidden;
+  background: #141a22;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+.pip-circle.is-safe {
+  border-color: #3ef09b;
+  box-shadow: 0 0 24px rgba(46, 235, 145, 0.45);
+}
+
+.pip-circle.is-danger {
+  border-color: #ffffff;
+}
+
+#pipStream {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.pip-telemetry {
+  display: flex;
+  gap: 6px;
+}
+
+.hand-chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: rgba(12, 18, 26, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #cfe4f5;
+  backdrop-filter: blur(8px);
+}
+
+.hand-chip.active {
+  border-color: #22e6ff;
+  color: #ffffff;
+  background: rgba(10, 50, 70, 0.85);
+}
+
+/* SEMI-TRANSPARENT HUD GESTURE BADGES */
+.gesture-hud {
+  position: absolute;
+  left: 22px;
+  bottom: 24px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.gesture-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 13px;
+  border-radius: 10px;
+  background: rgba(12, 18, 26, 0.62);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(8px);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: rgba(226, 236, 245, 0.82);
+  transition: transform 0.15s ease, background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.gesture-badge .g-key {
+  color: #7ee4fa;
+}
+
+.gesture-badge .g-arrow {
+  opacity: 0.6;
+}
+
+.gesture-badge.is-active {
+  transform: translateX(5px);
+  background: rgba(10, 56, 78, 0.88);
+  border-color: #22e6ff;
+  color: #ffffff;
+  box-shadow: 0 0 18px rgba(34, 230, 255, 0.38);
+}
+
+.gesture-badge.is-brake.is-active {
+  background: rgba(145, 26, 26, 0.9);
+  border-color: #ff5b5b;
+  box-shadow: 0 0 18px rgba(255, 80, 80, 0.45);
+}
+
+.gesture-badge.is-go.is-active {
+  background: rgba(14, 92, 56, 0.88);
+  border-color: #2ce68a;
+  box-shadow: 0 0 18px rgba(44, 230, 138, 0.4);
+}

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MotoSafe AI — Helmet Safety &amp; Gesture Riding Simulator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800&family=Orbitron:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Fullscreen 3-Lane Road + Traffic + Motorcycle POV Cockpit Canvas -->
+    <canvas id="simCanvas"></canvas>
+
+    <!-- TOP-LEFT: Interactive ON / OFF Switch (Index Finger or Mouse Click) -->
+    <div class="hud-top-left">
+      <button id="onOffBtn" class="power-btn is-off" type="button" aria-pressed="false">
+        <svg class="dwell-ring" viewBox="0 0 64 64">
+          <circle class="dwell-track" cx="32" cy="32" r="28" />
+          <circle id="dwellArc" class="dwell-arc" cx="32" cy="32" r="28" />
+        </svg>
+        <span class="power-dot"></span>
+        <span class="power-text-wrap">
+          <span class="power-label">IGNITE</span>
+          <span id="powerStateText" class="power-state">OFF</span>
+        </span>
+      </button>
+      <div id="indexHint" class="index-hint">
+        Point <strong>INDEX FINGER</strong> (L/R) or Click
+      </div>
+      <div id="camStatusPill" class="cam-pill">Connecting camera...</div>
+
+      <!-- Collapsible Demo Controls (only shown prominently when no physical webcam is attached) -->
+      <div id="demoPanel" class="demo-panel hidden">
+        <div class="demo-title">Webcam Fallback / Virtual Simulator</div>
+        <div class="demo-row">
+          <button id="browserCamBtn" class="demo-btn demo-btn-primary" type="button">Use Browser Cam</button>
+          <button id="retryCamBtn" class="demo-btn" type="button">Retry OpenCV Cam</button>
+          <button id="demoHelmetBtn" class="demo-btn" type="button">Toggle Helmet</button>
+        </div>
+        <div class="demo-row">
+          <button class="demo-btn" data-demo-gesture="NONE" type="button">Coast</button>
+          <button class="demo-btn" data-demo-gesture="OPEN" type="button">Both Open</button>
+          <button class="demo-btn" data-demo-gesture="LEFT_FIST" type="button">L Fist</button>
+          <button class="demo-btn" data-demo-gesture="RIGHT_FIST" type="button">R Fist</button>
+          <button class="demo-btn" data-demo-gesture="BOTH_FISTS" type="button">Brake</button>
+          <button class="demo-btn" data-demo-gesture="INDEX" type="button">Index ☝</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TOP-CENTER: Helmet Compliance Warning / Verified Banner + 10-Min Scan Tracker -->
+    <div class="top-center-stack">
+      <div id="helmetBanner" class="helmet-banner status-danger">
+        <div class="banner-icon" id="bannerIcon">⚠</div>
+        <div class="banner-content">
+          <div id="bannerTitle" class="banner-title">NO HELMET DETECTED - IGNITION LOCKED</div>
+          <div id="bannerSub" class="banner-sub">WEAR HELMET OR TURBAN / PAGRI TO ENABLE IGNITION</div>
+        </div>
+      </div>
+
+      <div class="scan-bar">
+        <div class="scan-timer-pill">
+          <span class="scan-dot"></span>
+          <span id="scanTimerText">NEXT 1-MIN SCAN: 01:00</span>
+        </div>
+        <button id="demoSpeedBtn" class="demo-speed-btn" type="button" aria-pressed="false">
+          DEMO 10x SPEED
+        </button>
+      </div>
+    </div>
+
+    <!-- TOP-RIGHT: Circular Picture-in-Picture Webcam Feed with MediaPipe Overlays -->
+    <div class="pip-wrapper">
+      <div id="pipFrame" class="pip-circle">
+        <img id="pipStream" src="/video_feed" alt="Live MediaPipe Selfie Feed" />
+      </div>
+      <div class="pip-telemetry">
+        <span id="leftHandBadge" class="hand-chip">L: NONE</span>
+        <span id="rightHandBadge" class="hand-chip">R: NONE</span>
+      </div>
+    </div>
+
+    <!-- HUD GESTURE INDICATOR BADGES -->
+    <div class="gesture-hud">
+      <div id="badgeLeftFist" class="gesture-badge">
+        <span class="g-key">LEFT FIST</span>
+        <span class="g-arrow">→</span>
+        <span class="g-act">TURN LEFT</span>
+      </div>
+      <div id="badgeRightFist" class="gesture-badge">
+        <span class="g-key">RIGHT FIST</span>
+        <span class="g-arrow">→</span>
+        <span class="g-act">TURN RIGHT</span>
+      </div>
+      <div id="badgeBothFists" class="gesture-badge">
+        <span class="g-key">BOTH FISTS</span>
+        <span class="g-arrow">→</span>
+        <span class="g-act">BRAKE</span>
+      </div>
+      <div id="badgeBothOpen" class="gesture-badge">
+        <span class="g-key">BOTH OPEN</span>
+        <span class="g-arrow">→</span>
+        <span class="g-act">ACCELERATE</span>
+      </div>
+      <div id="badgeIndex" class="gesture-badge">
+        <span class="g-key">INDEX FINGER</span>
+        <span class="g-arrow">→</span>
+        <span class="g-act">ON / OFF</span>
+      </div>
+    </div>
+    <!-- INDEX-FINGER AIR CURSOR (Visible when only Index Finger is UP) -->
+    <div id="indexCursor" class="index-cursor hidden" aria-hidden="true">
+      <svg class="cursor-svg" viewBox="0 0 48 48">
+        <circle class="cursor-track" cx="24" cy="24" r="19" />
+        <circle id="cursorArc" class="cursor-arc" cx="24" cy="24" r="19" />
+      </svg>
+      <span class="cursor-dot"></span>
+      <span class="cursor-tag">INDEX</span>
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
