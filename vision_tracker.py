@@ -1,4 +1,7 @@
+import gc
 import math
+import os
+import sys
 import threading
 import time
 from typing import Dict, Optional, Tuple, Union
@@ -6,9 +9,16 @@ from typing import Dict, Optional, Tuple, Union
 import cv2
 import mediapipe as mp
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 from train_model import ensure_trained_model
+
+cv2.setNumThreads(1)
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
 
 
 class VisionTracker:
@@ -68,38 +78,35 @@ class VisionTracker:
         self._index_hold_threshold = 0.45
         self._last_probe_time = 0.0
         self._browser_frame: Optional[np.ndarray] = None
+        self._browser_jpeg_raw: Optional[bytes] = None
+        self._browser_seq = 0
         self._browser_frame_ts = 0.0
+        self._browser_event = threading.Event()
+        self._last_yolo_ts = 0.0
+        self._last_yolo_res: Tuple[str, float] = ("none", 0.0)
+        self._last_demo_key: Optional[Tuple[object, ...]] = None
 
         # Local Ultralytics YOLO helmet/turban classifier (auto-trains best.pt if missing)
         weights_path = ensure_trained_model()
         self._yolo_model = YOLO(str(weights_path))
         print(f"[VisionTracker] Loaded YOLO classifier: {weights_path}")
 
-        # MediaPipe solutions (Hands + Pose) & OpenCV Haar face cascade
+        # MediaPipe Hands (model_complexity=0 keeps RAM & CPU low for cloud/edge) & OpenCV Haar
         self._mp_hands = mp.solutions.hands
-        self._mp_pose = mp.solutions.pose
         self._mp_draw = mp.solutions.drawing_utils
 
         self._hands = self._mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            model_complexity=1,
-            min_detection_confidence=0.60,
-            min_tracking_confidence=0.55,
+            model_complexity=0,
+            min_detection_confidence=0.55,
+            min_tracking_confidence=0.50,
         )
-        try:
-            self._pose = self._mp_pose.Pose(
-                static_image_mode=False,
-                model_complexity=1,
-                smooth_landmarks=True,
-                min_detection_confidence=0.50,
-                min_tracking_confidence=0.50,
-            )
-        except Exception:
-            self._pose = None
+        self._pose = None
         self._face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        gc.collect()
 
     def _init_placeholder_frame(self) -> None:
         img = np.zeros((360, 360, 3), dtype=np.uint8)
@@ -144,6 +151,13 @@ class VisionTracker:
             self._cap = None
 
         self._last_probe_time = time.monotonic()
+        # Headless cloud Linux (e.g. Render) has no /dev/video0; skip slow V4L2 probing
+        if sys.platform != "win32" and not os.path.exists(f"/dev/video{self.camera_index}"):
+            self.camera_available = False
+            self.camera_label = "BROWSER / CLOUD CAM"
+            print("[VisionTracker] No /dev/video device; awaiting browser webcam frames")
+            return False
+
         # Try default backend (MSMF on Windows 11) first, then DSHOW, across indices 0..2
         candidates = [
             (self.camera_index, cv2.CAP_MSMF),
@@ -185,13 +199,13 @@ class VisionTracker:
         return False
 
     def push_browser_frame(self, jpeg_bytes: bytes) -> bool:
-        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
+        if not jpeg_bytes:
             return False
         with self._lock:
-            self._browser_frame = img
+            self._browser_jpeg_raw = jpeg_bytes
+            self._browser_seq += 1
             self._browser_frame_ts = time.monotonic()
+        self._browser_event.set()
         return True
 
     def retry_camera(self) -> bool:
@@ -277,6 +291,9 @@ class VisionTracker:
 
     def get_telemetry(self) -> Dict[str, object]:
         with self._lock:
+            browser_live = (
+                self._browser_seq > 0 or self._browser_frame is not None
+            ) and (time.monotonic() - self._browser_frame_ts) < 3.0
             return {
                 "system_on": self.system_on,
                 "helmet_detected": self.helmet_detected,
@@ -297,10 +314,7 @@ class VisionTracker:
                 "cursor_active": self.cursor_active,
                 "cursor_x": round(self.cursor_x, 4),
                 "cursor_y": round(self.cursor_y, 4),
-                "camera_available": self.camera_available or (
-                    self._browser_frame is not None
-                    and (time.monotonic() - self._browser_frame_ts) < 2.0
-                ),
+                "camera_available": self.camera_available or browser_live,
                 "camera_label": self.camera_label,
                 "fps": round(self.fps, 1),
                 "demo_state": dict(self.demo_state),
@@ -431,6 +445,15 @@ class VisionTracker:
                 if x2 > x1 + 30 and bot_y > top_y + 30:
                     pose_box = (x1, top_y, x2, bot_y)
 
+        # Fallback: if Haar missed (common for full-face helmets / visors / turbans),
+        # inspect upper-center head region if scene has sufficient structure (non-blank wall).
+        if pose_box is None:
+            ux1, uy1 = int(w * 0.18), int(h * 0.04)
+            ux2, uy2 = int(w * 0.82), int(h * 0.86)
+            roi = gray[uy1:uy2, ux1:ux2]
+            if roi.size > 0 and float(np.std(roi)) > 16.0:
+                pose_box = (ux1, uy1, ux2, uy2)
+
         return pose_box, head_points
 
     def _classify_head_yolo(
@@ -453,7 +476,8 @@ class VisionTracker:
         if crop.size == 0:
             return "none", 0.0
 
-        res = self._yolo_model(crop, imgsz=224, verbose=False)[0]
+        with torch.no_grad():
+            res = self._yolo_model(crop, imgsz=224, verbose=False)[0]
         pred_idx = int(res.probs.top1)
         pred_cls = str(res.names[pred_idx])
         conf = float(res.probs.top1conf)
@@ -734,13 +758,15 @@ class VisionTracker:
     def _loop(self) -> None:
         self._open_camera()
         last_t = time.perf_counter()
-        fps_smooth = 30.0
+        fps_smooth = 15.0
+        last_browser_seq = -1
 
         while self._running:
+            if not self.camera_available:
+                self._browser_event.wait(timeout=0.25)
+                self._browser_event.clear()
+
             now = time.perf_counter()
-            dt = max(0.001, min(0.1, now - last_t))
-            last_t = now
-            fps_smooth = 0.9 * fps_smooth + 0.1 * (1.0 / dt)
 
             left_state = "NONE"
             right_state = "NONE"
@@ -753,18 +779,10 @@ class VisionTracker:
             cursor_active = False
             raw_cursor_xy: Optional[Tuple[float, float]] = None
 
-            with self._lock:
-                browser_img = (
-                    self._browser_frame.copy()
-                    if (
-                        self._browser_frame is not None
-                        and (time.monotonic() - self._browser_frame_ts) < 2.0
-                    )
-                    else None
-                )
-
             raw_frame = None
             using_live = False
+            is_browser_cam = False
+
             if self.camera_available and self._cap is not None:
                 ok, cam_frame = self._cap.read()
                 if ok and cam_frame is not None:
@@ -773,22 +791,47 @@ class VisionTracker:
                 else:
                     self.camera_available = False
                     self.camera_label = "DEMO MODE (WEBCAM LOST)"
-            elif browser_img is not None:
-                raw_frame = browser_img
-                using_live = True
-                self.camera_label = "LIVE BROWSER CAM"
+            else:
+                with self._lock:
+                    b_seq = self._browser_seq
+                    b_raw = self._browser_jpeg_raw
+                    b_ts = self._browser_frame_ts
+                    b_img = self._browser_frame
+                if (time.monotonic() - b_ts) < 3.0 and (b_raw is not None or b_img is not None):
+                    if b_seq == last_browser_seq:
+                        # No new browser frame yet; skip redundant AI inference on Render 0.1 CPU
+                        continue
+                    last_browser_seq = b_seq
+                    if b_raw is not None:
+                        arr = np.frombuffer(b_raw, dtype=np.uint8)
+                        decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if decoded is not None:
+                            raw_frame = decoded
+                    elif b_img is not None:
+                        raw_frame = b_img.copy()
+                    if raw_frame is not None:
+                        using_live = True
+                        is_browser_cam = True
+                        self.camera_label = "LIVE BROWSER CAM"
+
+            dt = max(0.001, min(1.5, now - last_t))
+            last_t = now
+            fps_smooth = 0.85 * fps_smooth + 0.15 * min(60.0, 1.0 / dt)
 
             if using_live and raw_frame is not None:
                 # Mirror selfie frame for intuitive PiP & steering
                 frame = cv2.flip(raw_frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # 1. MediaPipe Pose + Haar Face -> Head Box & Local YOLO Classification
-                pose_res = self._pose.process(rgb) if self._pose is not None else None
-                head_box, head_pts = self._detect_head_box(frame, pose_res)
+                # 1. OpenCV Haar Face -> Head Box & Local YOLO Classification
+                head_box, head_pts = self._detect_head_box(frame, None)
                 if head_box is not None:
                     face_found = True
-                    yolo_cls, yolo_conf = self._classify_head_yolo(frame, head_box)
+                    mono_now = time.monotonic()
+                    if (mono_now - self._last_yolo_ts) >= 0.40 or self._last_yolo_res[0] == "none":
+                        self._last_yolo_res = self._classify_head_yolo(frame, head_box)
+                        self._last_yolo_ts = mono_now
+                    yolo_cls, yolo_conf = self._last_yolo_res
 
                     with self._lock:
                         ov = self.helmet_override
@@ -881,7 +924,7 @@ class VisionTracker:
                                 cv2.LINE_AA,
                             )
 
-                display_frame = self._center_square_crop(frame, 360)
+                display_frame = None if is_browser_cam else self._center_square_crop(frame, 360)
             else:
                 # Synthetic demo camera frame when no webcam is attached
                 display_frame, left_state, right_state, demo_cls = self._render_demo_frame(
@@ -948,9 +991,13 @@ class VisionTracker:
             else:
                 gesture = "NONE"
 
-            ok_enc, buf = cv2.imencode(
-                ".jpg", display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-            )
+            ok_enc = False
+            buf = None
+            if display_frame is not None:
+                ok_enc, buf = cv2.imencode(
+                    ".jpg", display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
+                )
+
             with self._lock:
                 self.face_detected = face_found
                 self.helmet_detected = helmet_now
@@ -970,8 +1017,9 @@ class VisionTracker:
                 self.cursor_x = self._cursor_x_ema
                 self.cursor_y = self._cursor_y_ema
                 self.fps = fps_smooth
-                if ok_enc:
+                if ok_enc and buf is not None:
                     self._latest_jpeg = buf.tobytes()
                     self._frame_seq += 1
 
-            time.sleep(0.015)
+            if self.camera_available:
+                time.sleep(0.02)

@@ -251,10 +251,10 @@ async function startBrowserCam() {
 
     browserCamBtn.textContent = "Browser Cam Active";
 
-    // Single-flight upload loop (prevents 502 overload on Render's 0.1 CPU)
+    // Single-flight upload loop (prevents overload on Render's 0.1 CPU)
     let uploadInFlight = false;
     setInterval(() => {
-      if (!browserCamStream || uploadInFlight) return;
+      if (!browserCamStream || uploadInFlight || document.hidden) return;
       uploadInFlight = true;
       capCtx.drawImage(liveVideo, 0, 0, capCanvas.width, capCanvas.height);
       capCanvas.toBlob(
@@ -274,9 +274,9 @@ async function startBrowserCam() {
           }
         },
         "image/jpeg",
-        0.65
+        0.60
       );
-    }, 350);
+    }, 450);
   } catch (err) {
     camStatusPill.textContent = "Browser cam denied/unavailable";
     console.error("Browser cam error:", err);

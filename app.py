@@ -1,11 +1,12 @@
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Union
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -47,6 +48,16 @@ class DemoStateRequest(BaseModel):
 @app.get("/")
 async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
+
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/api/state")
@@ -102,7 +113,7 @@ async def video_feed():
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
                 )
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.05)
 
     return StreamingResponse(
         frame_generator(),
@@ -116,7 +127,7 @@ async def telemetry_stream():
         while True:
             payload = json.dumps(tracker.get_telemetry())
             yield f"data: {payload}\n\n"
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.10)
 
     return StreamingResponse(
         event_generator(),
@@ -131,4 +142,6 @@ async def telemetry_stream():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+    port = int(os.environ.get("PORT", 8000))
+    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    uvicorn.run("app:app", host=host, port=port, reload=False)
