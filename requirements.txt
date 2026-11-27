@@ -1,6 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
 fastapi>=0.115.0
 uvicorn>=0.30.0
-opencv-python>=4.9.0
-mediapipe>=0.10.13
+opencv-python-headless>=4.9.0
+mediapipe==0.10.14
 numpy>=1.26.0
 ultralytics>=8.3.0
