@@ -15,6 +15,9 @@ const bannerTitle = document.getElementById("bannerTitle");
 const bannerSub = document.getElementById("bannerSub");
 
 const pipFrame = document.getElementById("pipFrame");
+const pipStream = document.getElementById("pipStream");
+const pipOverlay = document.getElementById("pipOverlay");
+const pipCtx = pipOverlay.getContext("2d");
 const leftHandBadge = document.getElementById("leftHandBadge");
 const rightHandBadge = document.getElementById("rightHandBadge");
 
@@ -83,7 +86,24 @@ let cursorCooldownSec = 0;
 let toggleInFlight = false;
 const DWELL_THRESHOLD_SEC = 0.50;
 let browserCamStream = null;
+let liveVideoEl = null;
+let snapCanvas = null;
+let snapCtx = null;
 let autoCamTried = false;
+let scanInFlight = false;
+const keysPressed = new Set();
+
+// Real-time client-side MediaPipe Hands state (active from start, zero backend frame polling)
+let clientHandsActive = false;
+let clientHandsState = {
+  left_hand: "NONE",
+  right_hand: "NONE",
+  active_gesture: "NONE",
+  cursor_active: false,
+  cursor_x: 0.5,
+  cursor_y: 0.5,
+  hands_landmarks: [],
+};
 
 // Local smooth riding physics state
 let speedKmh = 0;
@@ -136,12 +156,45 @@ function setBannerAlert(type, title, sub, durationMs = 4200) {
   syncHud();
 }
 
+function captureSnapshotB64() {
+  if (!liveVideoEl || liveVideoEl.readyState < 2) return null;
+  if (!snapCanvas) {
+    snapCanvas = document.createElement("canvas");
+    snapCanvas.width = 320;
+    snapCanvas.height = 240;
+    snapCtx = snapCanvas.getContext("2d");
+  }
+  snapCtx.drawImage(liveVideoEl, 0, 0, snapCanvas.width, snapCanvas.height);
+  return snapCanvas.toDataURL("image/jpeg", 0.75);
+}
+
 async function toggleIgnition(clearDemoIndex = false) {
   if (toggleInFlight) return;
   toggleInFlight = true;
   try {
-    const res = await fetch("/api/toggle", { method: "POST" });
+    const turningOn = !telemetry.system_on;
+    let image_b64 = null;
+    if (turningOn) {
+      setBannerAlert(
+        "safe",
+        "CAPTURING IMAGE & VERIFYING HELMET...",
+        "RUNNING LOCAL YOLO HELMET / TURBAN COMPLIANCE CHECK",
+        2500
+      );
+      if (!liveVideoEl || liveVideoEl.readyState < 2) {
+        await startBrowserCam();
+      }
+      image_b64 = captureSnapshotB64();
+    }
+    const res = await fetch("/api/toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state: turningOn, image_b64 }),
+    });
     const data = await res.json();
+    if (data?.telemetry) {
+      telemetry = data.telemetry;
+    }
     telemetry.system_on = Boolean(data.system_on);
 
     if (data.blocked) {
@@ -236,47 +289,16 @@ async function startBrowserCam() {
       zIndex: "5",
     });
 
-    // Hide any placeholder img/canvas inside pipFrame and mount liveVideo
-    Array.from(pipFrame.children).forEach((el) => {
-      el.style.display = "none";
-    });
+    // Hide raw MJPEG placeholder img while keeping pipOverlay canvas above liveVideo
+    pipStream.style.display = "none";
     pipFrame.style.position = "relative";
-    pipFrame.appendChild(liveVideo);
+    pipFrame.insertBefore(liveVideo, pipOverlay);
     await liveVideo.play();
-
-    const capCanvas = document.createElement("canvas");
-    capCanvas.width = 320;
-    capCanvas.height = 240;
-    const capCtx = capCanvas.getContext("2d");
+    liveVideoEl = liveVideo;
 
     browserCamBtn.textContent = "Browser Cam Active";
-
-    // Single-flight upload loop (prevents overload on Render's 0.1 CPU)
-    let uploadInFlight = false;
-    setInterval(() => {
-      if (!browserCamStream || uploadInFlight || document.hidden) return;
-      uploadInFlight = true;
-      capCtx.drawImage(liveVideo, 0, 0, capCanvas.width, capCanvas.height);
-      capCanvas.toBlob(
-        async (blob) => {
-          try {
-            if (blob) {
-              await fetch("/api/upload_frame", {
-                method: "POST",
-                headers: { "Content-Type": "image/jpeg" },
-                body: blob,
-              });
-            }
-          } catch (_) {
-            // ignore transient network errors
-          } finally {
-            uploadInFlight = false;
-          }
-        },
-        "image/jpeg",
-        0.60
-      );
-    }, 450);
+    camStatusPill.textContent = "LIVE HANDS • YOLO SNAPSHOT ON IGNITE & 1-MIN";
+    startBrowserHandTracker(liveVideo);
   } catch (err) {
     camStatusPill.textContent = "Browser cam denied/unavailable";
     console.error("Browser cam error:", err);
@@ -285,13 +307,149 @@ async function startBrowserCam() {
 
 browserCamBtn.addEventListener("click", startBrowserCam);
 
-// If OpenCV didn't find a camera after 3s, automatically try browser webcam fallback
+function dist2D(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function classifyHandPoseJS(lms) {
+  const wrist = lms[0];
+  const isExtended = (tip, pip, mcp) =>
+    dist2D(wrist, lms[tip]) > dist2D(wrist, lms[pip]) * 1.12 &&
+    dist2D(lms[mcp], lms[tip]) > dist2D(lms[mcp], lms[pip]) * 1.08;
+  const isCurled = (tip, pip) =>
+    dist2D(wrist, lms[tip]) < dist2D(wrist, lms[pip]) * 1.07;
+
+  const indexUp = isExtended(8, 6, 5);
+  const middleUp = isExtended(12, 10, 9);
+  const ringUp = isExtended(16, 14, 13);
+  const pinkyUp = isExtended(20, 18, 17);
+
+  const indexCurled = isCurled(8, 6);
+  const middleCurled = isCurled(12, 10);
+  const ringCurled = isCurled(16, 14);
+  const pinkyCurled = isCurled(20, 18);
+
+  const upCount = Number(indexUp) + Number(middleUp) + Number(ringUp) + Number(pinkyUp);
+  const curledCount =
+    Number(indexCurled) + Number(middleCurled) + Number(ringCurled) + Number(pinkyCurled);
+
+  if (indexUp && middleCurled && ringCurled && pinkyCurled) return "INDEX_ONLY";
+  if (upCount === 0 && curledCount >= 3) return "FIST";
+  if (upCount >= 3) return "OPEN";
+  return "NEUTRAL";
+}
+
+function onBrowserHandResults(results) {
+  let leftState = "NONE";
+  let rightState = "NONE";
+  let cursorActive = false;
+  let cursorX = clientHandsState.cursor_x;
+  let cursorY = clientHandsState.cursor_y;
+  const handsPayload = [];
+
+  const allLms = results?.multiHandLandmarks || [];
+  const allHanded = results?.multiHandedness || [];
+
+  if (allLms.length > 0) {
+    const detected = [];
+    for (let i = 0; i < allLms.length; i++) {
+      const lms = allLms[i];
+      const rawLabel = (allHanded[i]?.label || "Right").toUpperCase();
+      const pose = classifyHandPoseJS(lms);
+      detected.push({ wristX: lms[0].x, side: rawLabel, lms, pose });
+    }
+    if (detected.length === 2) {
+      detected.sort((a, b) => a.wristX - b.wristX);
+      detected[0].side = "LEFT";
+      detected[1].side = "RIGHT";
+    }
+    for (const item of detected) {
+      if (item.side === "LEFT") leftState = item.pose;
+      else rightState = item.pose;
+      handsPayload.push({
+        side: item.side,
+        pose: item.pose,
+        points: item.lms.map((p) => [p.x, p.y]),
+      });
+      if (item.pose === "INDEX_ONLY" && !cursorActive) {
+        const tip = item.lms[8];
+        cursorX = Math.max(0, Math.min(1, (tip.x - 0.14) / 0.72));
+        cursorY = Math.max(0, Math.min(1, (tip.y - 0.14) / 0.72));
+        cursorActive = true;
+      }
+    }
+  }
+
+  let idxHand = "NONE";
+  if (leftState === "INDEX_ONLY" && rightState !== "FIST") idxHand = "LEFT";
+  else if (rightState === "INDEX_ONLY" && leftState !== "FIST") idxHand = "RIGHT";
+
+  let gesture = "NONE";
+  if (idxHand !== "NONE") gesture = "INDEX_TOGGLE";
+  else if (leftState === "FIST" && rightState === "FIST") gesture = "BOTH_FISTS";
+  else if (leftState === "FIST") gesture = "LEFT_FIST";
+  else if (rightState === "FIST") gesture = "RIGHT_FIST";
+  else if (leftState === "OPEN" && rightState === "OPEN") gesture = "BOTH_OPEN";
+
+  clientHandsState = {
+    left_hand: leftState,
+    right_hand: rightState,
+    active_gesture: gesture,
+    cursor_active: cursorActive,
+    cursor_x: cursorX,
+    cursor_y: cursorY,
+    hands_landmarks: handsPayload,
+  };
+  syncHandUiOnly();
+}
+
+function startBrowserHandTracker(videoEl) {
+  if (typeof window.Hands === "undefined") {
+    camStatusPill.textContent = "HAND TRACKER CDN FAILED • CHECK INTERNET";
+    console.warn("MediaPipe Hands CDN script not loaded; using keyboard/demo gestures.");
+    return;
+  }
+  const hands = new window.Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+  });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.45,
+    minTrackingConfidence: 0.45,
+    selfieMode: true,
+  });
+  hands.onResults(onBrowserHandResults);
+  clientHandsActive = true;
+  syncHud();
+
+  let sending = false;
+  let lastSentMs = 0;
+  async function pumpHands(nowMs) {
+    if (!browserCamStream) return;
+    if (!sending && !document.hidden && videoEl.readyState >= 2 && nowMs - lastSentMs >= 45) {
+      sending = true;
+      lastSentMs = nowMs;
+      try {
+        await hands.send({ image: videoEl });
+      } catch (err) {
+        console.warn("Hands frame error:", err);
+      } finally {
+        sending = false;
+      }
+    }
+    requestAnimationFrame(pumpHands);
+  }
+  requestAnimationFrame(pumpHands);
+}
+
+// Initialize live camera preview + client-side hand tracking at startup (no per-second server image uploads)
 setTimeout(() => {
-  if (!telemetry.camera_available && !autoCamTried) {
+  if (!browserCamStream && !autoCamTried) {
     autoCamTried = true;
     startBrowserCam();
   }
-}, 3000);
+}, 800);
 
 document.querySelectorAll("[data-demo-gesture]").forEach((btn) => {
   btn.addEventListener("click", async () => {
@@ -345,21 +503,22 @@ function updateScanTimerDisplay() {
   scanTimerText.textContent = `NEXT 1-MIN SCAN: ${mins}:${secs}`;
 }
 
-function updatePeriodicScan(dt) {
-  if (!telemetry.system_on) {
-    scanRemainingSec = demoFastScan ? 10 : 60;
-    scanViolationBuffering = false;
-    updateScanTimerDisplay();
-    return;
-  }
-
-  if (telemetry.helmet_detected) {
-    scanViolationBuffering = false;
-  }
-
-  scanRemainingSec -= dt;
-  if (scanRemainingSec <= 0) {
-    scanRemainingSec = demoFastScan ? 10 : 60;
+async function runPeriodicComplianceScan() {
+  if (scanInFlight || !telemetry.system_on) return;
+  scanInFlight = true;
+  try {
+    const image_b64 = captureSnapshotB64();
+    const res = await fetch("/api/compliance_scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_b64 }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.telemetry) {
+        telemetry = data.telemetry;
+      }
+    }
     if (telemetry.helmet_detected) {
       scanViolationBuffering = false;
       setBannerAlert(
@@ -378,8 +537,51 @@ function updatePeriodicScan(dt) {
         4000
       );
     }
+    syncHud();
+  } catch (_) {
+    // ignore transient network errors
+  } finally {
+    scanInFlight = false;
+  }
+}
+
+function updatePeriodicScan(dt) {
+  if (!telemetry.system_on) {
+    scanRemainingSec = demoFastScan ? 10 : 60;
+    scanViolationBuffering = false;
+    updateScanTimerDisplay();
+    return;
+  }
+
+  scanRemainingSec -= dt;
+  if (scanRemainingSec <= 0) {
+    scanRemainingSec = demoFastScan ? 10 : 60;
+    runPeriodicComplianceScan();
   }
   updateScanTimerDisplay();
+}
+
+function syncHandUiOnly() {
+  const leftHand =
+    clientHandsActive && clientHandsState.left_hand !== "NONE"
+      ? clientHandsState.left_hand
+      : clientHandsActive && telemetry.left_hand === "NONE"
+      ? "NONE"
+      : telemetry.left_hand;
+  const rightHand =
+    clientHandsActive && clientHandsState.right_hand !== "NONE"
+      ? clientHandsState.right_hand
+      : clientHandsActive && telemetry.right_hand === "NONE"
+      ? "NONE"
+      : telemetry.right_hand;
+
+  leftHandBadge.textContent = `L: ${leftHand.replace("_ONLY", "")}`;
+  rightHandBadge.textContent = `R: ${rightHand.replace("_ONLY", "")}`;
+  leftHandBadge.classList.toggle("active", leftHand !== "NONE");
+  rightHandBadge.classList.toggle("active", rightHand !== "NONE");
+
+  syncGestureBadges();
+  drawPipOverlay();
 }
 
 function syncHud() {
@@ -390,8 +592,12 @@ function syncHud() {
   powerStateText.textContent = telemetry.system_on ? "ON" : "OFF";
 
   // Camera status & optional Demo controls visibility
-  camStatusPill.textContent = `${telemetry.camera_label} • ${Math.round(telemetry.fps || 0)} FPS`;
-  demoPanel.classList.toggle("hidden", Boolean(telemetry.camera_available));
+  if (clientHandsActive) {
+    camStatusPill.textContent = `LIVE HANDS • ${telemetry.camera_label}`;
+  } else {
+    camStatusPill.textContent = `${telemetry.camera_label}`;
+  }
+  demoPanel.classList.toggle("hidden", Boolean(telemetry.camera_available || browserCamStream));
 
   // Helmet / Turban compliance & alert banner
   const nowMs = performance.now();
@@ -445,14 +651,12 @@ function syncHud() {
       : `YOLO (${telemetry.yolo_class.toUpperCase()} ${confPct}%) • WEAR HELMET OR TURBAN / PAGRI TO IGNITE`;
   }
 
-  // Hand chips under circular PiP
-  leftHandBadge.textContent = `L: ${telemetry.left_hand.replace("_ONLY", "")}`;
-  rightHandBadge.textContent = `R: ${telemetry.right_hand.replace("_ONLY", "")}`;
-  leftHandBadge.classList.toggle("active", telemetry.left_hand !== "NONE");
-  rightHandBadge.classList.toggle("active", telemetry.right_hand !== "NONE");
+  // Hand chips, Gesture HUD badges, and PiP landmark overlay
+  syncHandUiOnly();
+}
 
-  // Gesture HUD badges
-  const g = telemetry.active_gesture;
+function syncGestureBadges() {
+  const g = getEffectiveGesture();
   badgeLeftFist.classList.toggle("is-active", g === "LEFT_FIST");
   badgeRightFist.classList.toggle("is-active", g === "RIGHT_FIST");
   badgeBothFists.classList.toggle("is-active", g === "BOTH_FISTS");
@@ -462,53 +666,144 @@ function syncHud() {
   badgeIndex.classList.toggle("is-active", g === "INDEX_TOGGLE");
 }
 
+const HAND_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [17, 18], [18, 19], [19, 20],
+  [0, 17],
+];
+
+function mapCoverPoint(nx, ny, size, aspect) {
+  if (aspect >= 1) {
+    return [(nx * aspect - (aspect - 1) * 0.5) * size, ny * size];
+  }
+  const inv = 1 / Math.max(0.1, aspect);
+  return [nx * size, (ny * inv - (inv - 1) * 0.5) * size];
+}
+
+function drawPipOverlay() {
+  const S = pipOverlay.width;
+  pipCtx.clearRect(0, 0, S, S);
+  // Only draw client canvas overlay when live browser <video> is active
+  if (!browserCamStream) return;
+
+  const aspect =
+    liveVideoEl && liveVideoEl.videoWidth && liveVideoEl.videoHeight
+      ? liveVideoEl.videoWidth / liveVideoEl.videoHeight
+      : telemetry.frame_aspect || 4 / 3;
+
+  // 1. Head / Face Bounding Box + YOLO label
+  const hb = telemetry.head_box;
+  if (hb) {
+    const [x1, y1] = mapCoverPoint(hb.x1, hb.y1, S, aspect);
+    const [x2, y2] = mapCoverPoint(hb.x2, hb.y2, S, aspect);
+    const col = hb.compliant ? "#3ef09b" : "#ff5252";
+    const cLen = Math.max(10, Math.min(20, (x2 - x1) * 0.22));
+
+    pipCtx.strokeStyle = col;
+    pipCtx.lineWidth = 2.2;
+    pipCtx.beginPath();
+    pipCtx.moveTo(x1, y1 + cLen); pipCtx.lineTo(x1, y1); pipCtx.lineTo(x1 + cLen, y1);
+    pipCtx.moveTo(x2 - cLen, y1); pipCtx.lineTo(x2, y1); pipCtx.lineTo(x2, y1 + cLen);
+    pipCtx.moveTo(x1, y2 - cLen); pipCtx.lineTo(x1, y2); pipCtx.lineTo(x1 + cLen, y2);
+    pipCtx.moveTo(x2 - cLen, y2); pipCtx.lineTo(x2, y2); pipCtx.lineTo(x2, y2 - cLen);
+    pipCtx.stroke();
+
+    const lbl = hb.label || (hb.compliant ? "HELMET OK" : "NO HELMET");
+    pipCtx.font = "bold 10px Inter, sans-serif";
+    const tw = pipCtx.measureText(lbl).width + 10;
+    const ly = Math.max(18, y1 - 4);
+    pipCtx.fillStyle = "rgba(12, 18, 28, 0.82)";
+    pipCtx.fillRect(x1, ly - 13, tw, 15);
+    pipCtx.fillStyle = col;
+    pipCtx.fillText(lbl, x1 + 5, ly - 2);
+  }
+
+  // 2. 21-Point MediaPipe Hand Skeleton Landmarks (prefer live client hands when active)
+  const hands =
+    clientHandsActive && clientHandsState.hands_landmarks.length > 0
+      ? clientHandsState.hands_landmarks
+      : telemetry.hands_landmarks || [];
+  for (const hand of hands) {
+    const pts = hand.points || [];
+    if (pts.length < 21) continue;
+
+    let lineCol = "#8fe2ff";
+    if (hand.pose === "FIST") lineCol = "#ffaa2b";
+    else if (hand.pose === "OPEN") lineCol = "#4df59e";
+    else if (hand.pose === "INDEX_ONLY") lineCol = "#ffe042";
+
+    const mapped = pts.map(([px, py]) => mapCoverPoint(px, py, S, aspect));
+
+    pipCtx.strokeStyle = lineCol;
+    pipCtx.lineWidth = 2.6;
+    pipCtx.beginPath();
+    for (const [a, b] of HAND_CONNECTIONS) {
+      pipCtx.moveTo(mapped[a][0], mapped[a][1]);
+      pipCtx.lineTo(mapped[b][0], mapped[b][1]);
+    }
+    pipCtx.stroke();
+
+    pipCtx.fillStyle = "#ffffff";
+    for (const [mx, my] of mapped) {
+      pipCtx.beginPath();
+      pipCtx.arc(mx, my, 3.1, 0, Math.PI * 2);
+      pipCtx.fill();
+    }
+
+    const [wx, wy] = mapped[0];
+    const tag = `${(hand.side || "H")[0]}:${(hand.pose || "").replace("_ONLY", "")}`;
+    pipCtx.font = "bold 9px Inter, sans-serif";
+    const tx = Math.max(8, Math.min(S - 54, wx - 20));
+    const ty = Math.max(14, Math.min(S - 8, wy + 16));
+    pipCtx.fillStyle = "rgba(12, 18, 28, 0.84)";
+    pipCtx.fillRect(tx - 3, ty - 10, 48, 13);
+    pipCtx.fillStyle = lineCol;
+    pipCtx.fillText(tag, tx, ty);
+  }
+}
+
+function getEffectiveGesture() {
+  if (keysPressed.has("Space") || keysPressed.has("ArrowDown") || keysPressed.has("KeyS")) {
+    return "BOTH_FISTS";
+  }
+  if (keysPressed.has("ArrowLeft") || keysPressed.has("KeyA")) {
+    return "LEFT_FIST";
+  }
+  if (keysPressed.has("ArrowRight") || keysPressed.has("KeyD")) {
+    return "RIGHT_FIST";
+  }
+  if (keysPressed.has("ArrowUp") || keysPressed.has("KeyW")) {
+    return "BOTH_OPEN";
+  }
+  if (clientHandsActive && clientHandsState.active_gesture !== "NONE") {
+    return clientHandsState.active_gesture;
+  }
+  return telemetry.active_gesture;
+}
+
+window.addEventListener("keydown", (e) => {
+  keysPressed.add(e.code);
+  syncGestureBadges();
+});
+window.addEventListener("keyup", (e) => {
+  keysPressed.delete(e.code);
+  syncGestureBadges();
+});
+
 function updatePhysics(dt) {
   const on = Boolean(telemetry.system_on);
   const buffering = Boolean(telemetry.mid_ride_buffering || scanViolationBuffering);
-  const g = telemetry.active_gesture;
+  const g = getEffectiveGesture();
 
-  // Full speed allowed while compliant OR before 2.0s mid-ride buffering triggers;
-  // caps smoothly to 20 km/h when buffering is active.
+  // Full speed allowed while compliant; caps smoothly to 20 km/h when buffering is active.
   const maxSpeed = buffering ? 20 : 85;
 
-  if (!on) {
-    // Ignition OFF -> locked at 0 km/h
-    speedKmh = Math.max(0, speedKmh - 45 * dt);
-    rollRad += (0 - rollRad) * Math.min(1, 7 * dt);
-    return;
-  }
-
-  // Speed dynamics
-  if (g === "BOTH_FISTS") {
-    // Apply strong braking toward 0 km/h
-    speedKmh = Math.max(0, speedKmh - 54 * dt);
-  } else if (g === "BOTH_OPEN") {
-    // Smooth acceleration up to cruising speed (capped at 20 if no helmet)
-    if (speedKmh < maxSpeed) {
-      speedKmh = Math.min(maxSpeed, speedKmh + 28 * dt);
-    } else {
-      // Buffer down smoothly if helmet was removed mid-ride
-      speedKmh = Math.max(maxSpeed, speedKmh - 30 * dt);
-    }
-  } else if (g === "LEFT_FIST" || g === "RIGHT_FIST") {
-    // Maintain gentle rolling momentum while steering, respecting helmet cap
-    if (speedKmh > maxSpeed) {
-      speedKmh = Math.max(maxSpeed, speedKmh - 26 * dt);
-    } else {
-      speedKmh = Math.max(0, speedKmh - 4 * dt);
-    }
-  } else {
-    // Coasting friction + helmet speed cap enforcement
-    if (speedKmh > maxSpeed) {
-      speedKmh = Math.max(maxSpeed, speedKmh - 26 * dt);
-    } else {
-      speedKmh = Math.max(0, speedKmh - 7 * dt);
-    }
-  }
-
-  // Steering / Lane shifting dynamics (Left Fist -> Left, Right Fist -> Right)
+  // Steering & handlebar roll work from the very start (even when OFF or no helmet)
   let targetRoll = 0;
-  const steerSpeed = 1.15; // lanes per second
+  const steerSpeed = 1.15;
   if (g === "LEFT_FIST") {
     lanePos = Math.max(-0.15, lanePos - steerSpeed * dt);
     targetRoll = -0.115;
@@ -516,23 +811,54 @@ function updatePhysics(dt) {
     lanePos = Math.min(2.15, lanePos + steerSpeed * dt);
     targetRoll = 0.115;
   } else {
-    // Softly center toward nearest valid lane [0, 1, 2] when not steering
     const nearest = Math.round(Math.max(0, Math.min(2, lanePos)));
     lanePos += (nearest - lanePos) * Math.min(1, 2.2 * dt);
   }
-
   rollRad += (targetRoll - rollRad) * Math.min(1, 8.5 * dt);
+
+  if (!on) {
+    // Ignition OFF -> speed remains locked at 0 km/h
+    speedKmh = Math.max(0, speedKmh - 45 * dt);
+    return;
+  }
+
+  // Speed dynamics when ON
+  if (g === "BOTH_FISTS") {
+    speedKmh = Math.max(0, speedKmh - 54 * dt);
+  } else if (g === "BOTH_OPEN") {
+    if (speedKmh < maxSpeed) {
+      speedKmh = Math.min(maxSpeed, speedKmh + 28 * dt);
+    } else {
+      speedKmh = Math.max(maxSpeed, speedKmh - 30 * dt);
+    }
+  } else if (g === "LEFT_FIST" || g === "RIGHT_FIST") {
+    if (speedKmh > maxSpeed) {
+      speedKmh = Math.max(maxSpeed, speedKmh - 26 * dt);
+    } else {
+      speedKmh = Math.max(0, speedKmh - 4 * dt);
+    }
+  } else {
+    if (speedKmh > maxSpeed) {
+      speedKmh = Math.max(maxSpeed, speedKmh - 26 * dt);
+    } else {
+      speedKmh = Math.max(0, speedKmh - 7 * dt);
+    }
+  }
 }
 
 function updateAirCursor(dt) {
   cursorCooldownSec = Math.max(0, cursorCooldownSec - dt);
-  const cActive = Boolean(telemetry.cursor_active);
+  const useClientCursor = clientHandsActive && clientHandsState.cursor_active;
+  const cActive = useClientCursor || Boolean(telemetry.cursor_active);
+  const rawCx = useClientCursor ? clientHandsState.cursor_x : (telemetry.cursor_x ?? 0.5);
+  const rawCy = useClientCursor ? clientHandsState.cursor_y : (telemetry.cursor_y ?? 0.5);
+
   indexCursor.classList.toggle("hidden", !cActive);
 
   let hoveringIgnition = false;
   if (cActive) {
-    const targetX = (telemetry.cursor_x ?? 0.5) * window.innerWidth;
-    const targetY = (telemetry.cursor_y ?? 0.5) * window.innerHeight;
+    const targetX = rawCx * window.innerWidth;
+    const targetY = rawCy * window.innerHeight;
     smoothCursorX += (targetX - smoothCursorX) * Math.min(1, 16 * dt);
     smoothCursorY += (targetY - smoothCursorY) * Math.min(1, 16 * dt);
     indexCursor.style.transform = `translate3d(${smoothCursorX.toFixed(1)}px, ${smoothCursorY.toFixed(1)}px, 0)`;
@@ -584,7 +910,7 @@ function renderLoop(nowMs) {
     rollRad,
     systemOn: telemetry.system_on,
     helmetDetected: telemetry.helmet_detected,
-    activeGesture: telemetry.active_gesture,
+    activeGesture: getEffectiveGesture(),
     timeSec: nowMs / 1000,
   });
 

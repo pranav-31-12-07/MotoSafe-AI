@@ -1,3 +1,4 @@
+import base64
 import gc
 import math
 import os
@@ -66,6 +67,9 @@ class VisionTracker:
         self.cursor_active = False
         self.cursor_x = 0.5
         self.cursor_y = 0.5
+        self.head_box_norm: Optional[Dict[str, object]] = None
+        self.hands_landmarks: list = []
+        self.frame_aspect: float = 4.0 / 3.0
         self.fps = 0.0
 
         # Internal temporal smoothing & gesture timers
@@ -80,8 +84,10 @@ class VisionTracker:
         self._browser_frame: Optional[np.ndarray] = None
         self._browser_jpeg_raw: Optional[bytes] = None
         self._browser_seq = 0
+        self._processed_browser_seq = 0
         self._browser_frame_ts = 0.0
         self._browser_event = threading.Event()
+        self._processed_event = threading.Event()
         self._last_yolo_ts = 0.0
         self._last_yolo_res: Tuple[str, float] = ("none", 0.0)
         self._last_demo_key: Optional[Tuple[object, ...]] = None
@@ -106,6 +112,14 @@ class VisionTracker:
         self._face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        # Warm up YOLO & MediaPipe once at boot so first live frame is fast
+        try:
+            dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+            with torch.no_grad():
+                self._yolo_model(dummy, imgsz=224, verbose=False)
+            self._hands.process(dummy)
+        except Exception:
+            pass
         gc.collect()
 
     def _init_placeholder_frame(self) -> None:
@@ -113,10 +127,10 @@ class VisionTracker:
         img[:] = (30, 24, 20)
         cv2.putText(
             img,
-            "STARTING CAMERA...",
-            (62, 185),
+            "READY - CLICK IGNITE",
+            (52, 185),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.68,
             (255, 225, 80),
             2,
             cv2.LINE_AA,
@@ -130,14 +144,10 @@ class VisionTracker:
         if self._running:
             return
         self._running = True
-        self.camera_label = "Probing camera..."
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        self.camera_label = "SNAPSHOT MODE (IGNITE / 1-MIN)"
 
     def stop(self) -> None:
         self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
         if self._cap is not None:
             self._cap.release()
             self._cap = None
@@ -158,14 +168,14 @@ class VisionTracker:
             print("[VisionTracker] No /dev/video device; awaiting browser webcam frames")
             return False
 
-        # Try default backend (MSMF on Windows 11) first, then DSHOW, across indices 0..2
+        # Prefer CAP_DSHOW first on Windows (fast & reliable); fallback to CAP_MSMF / CAP_ANY
         candidates = [
+            (self.camera_index, cv2.CAP_DSHOW),
             (self.camera_index, cv2.CAP_MSMF),
             (self.camera_index, cv2.CAP_ANY),
-            (self.camera_index, cv2.CAP_DSHOW),
+            (1, cv2.CAP_DSHOW),
             (1, cv2.CAP_MSMF),
-            (1, cv2.CAP_ANY),
-            (2, cv2.CAP_ANY),
+            (2, cv2.CAP_DSHOW),
         ]
         for idx, backend in candidates:
             if not self._running:
@@ -175,37 +185,275 @@ class VisionTracker:
             except Exception:
                 continue
             if cap.isOpened():
-                # Read first BEFORE setting resolution (prevents black/false frames on Windows)
+                # Configure resolution before reading warmup frames; reject pure-black dummy/IR feeds
+                if backend == cv2.CAP_DSHOW:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 ok, frame = False, None
+                non_black = False
                 for _ in range(15):
                     ok, frame = cap.read()
                     if ok and frame is not None and frame.size > 0:
-                        break
+                        if float(frame.mean()) >= 2.5 or float(frame.std()) >= 2.5:
+                            non_black = True
+                            break
                     time.sleep(0.05)
 
-                if ok and frame is not None and frame.size > 0:
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                if ok and non_black and frame is not None:
                     self._cap = cap
                     self.camera_available = True
                     self.camera_label = f"LIVE CAM #{idx}"
-                    print(f"[VisionTracker] Opened webcam index={idx} backend={backend}")
+                    print(f"[VisionTracker] Opened webcam index={idx} backend={backend} shape={frame.shape}")
                     return True
             cap.release()
 
         self.camera_available = False
-        self.camera_label = "DEMO MODE (NO WEBCAM)"
-        print("[VisionTracker] No webcam opened; running in Demo Mode")
+        self.camera_label = "BROWSER / CLOUD CAM"
+        print("[VisionTracker] No non-black OpenCV webcam found; awaiting browser webcam or Demo Mode")
         return False
+
+    def _capture_single_opencv_frame(self) -> Optional[np.ndarray]:
+        """Open camera briefly (if available), grab 1 fresh non-black frame, and release."""
+        if sys.platform != "win32" and not os.path.exists(f"/dev/video{self.camera_index}"):
+            return None
+        candidates = [
+            (self.camera_index, cv2.CAP_DSHOW),
+            (self.camera_index, cv2.CAP_MSMF),
+            (self.camera_index, cv2.CAP_ANY),
+            (1, cv2.CAP_DSHOW),
+        ]
+        for idx, backend in candidates:
+            try:
+                cap = cv2.VideoCapture(idx, backend)
+            except Exception:
+                continue
+            if cap.isOpened():
+                if backend == cv2.CAP_DSHOW:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                ok, frame = False, None
+                non_black = False
+                for _ in range(10):
+                    ok, frame = cap.read()
+                    if ok and frame is not None and frame.size > 0:
+                        if float(frame.mean()) >= 2.5 or float(frame.std()) >= 2.5:
+                            non_black = True
+                            break
+                    time.sleep(0.03)
+                cap.release()
+                if ok and non_black and frame is not None:
+                    self.camera_available = True
+                    self.camera_label = f"SNAPSHOT CAM #{idx}"
+                    return frame
+            else:
+                cap.release()
+        return None
+
+    def analyze_snapshot(
+        self, jpeg_bytes: Optional[bytes] = None, check_mid_ride: bool = False
+    ) -> Dict[str, object]:
+        """Run OpenCV + YOLO ('best.pt') + MediaPipe Hands on a single on-demand snapshot."""
+        raw_frame = None
+        source_label = "DEMO SNAPSHOT"
+
+        if jpeg_bytes:
+            arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+            decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if decoded is not None:
+                raw_frame = decoded
+                source_label = "SNAPSHOT (BROWSER CAM)"
+        else:
+            raw_frame = self._capture_single_opencv_frame()
+            if raw_frame is not None:
+                source_label = self.camera_label
+
+        if raw_frame is not None:
+            self._process_single_frame(
+                raw_frame, source_label=source_label, check_mid_ride=check_mid_ride
+            )
+        else:
+            # Demo mode fallback when no camera frame is available
+            display_frame, left_state, right_state, demo_cls = self._render_demo_frame(
+                time.perf_counter()
+            )
+            with self._lock:
+                ov = self.helmet_override
+            if ov in ("helmet", "special_case", "no_helmet"):
+                demo_cls = ov
+            yolo_cls = demo_cls
+            yolo_conf = 0.95 if demo_cls != "no_helmet" else 0.92
+            if demo_cls == "helmet":
+                helmet_now = True
+                comp_status, comp_label = "HELMET_VERIFIED", "HELMET DETECTED"
+            elif demo_cls == "special_case":
+                helmet_now = True
+                comp_status, comp_label = "TURBAN_EXEMPT", "TURBAN / PAGRI EXEMPT"
+            else:
+                helmet_now = False
+                comp_status, comp_label = "NO_HELMET", "NO HELMET DETECTED"
+            ok_enc, buf = cv2.imencode(
+                ".jpg", display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            )
+            with self._lock:
+                self.face_detected = True
+                self.helmet_detected = helmet_now
+                self.helmet_score = yolo_conf
+                self.yolo_class = yolo_cls
+                self.yolo_conf = yolo_conf
+                self.compliance_status = comp_status
+                self.compliance_label = comp_label
+                self.left_hand_state = left_state
+                self.right_hand_state = right_state
+                self.head_box_norm = {
+                    "x1": 0.33,
+                    "y1": 0.23,
+                    "x2": 0.67,
+                    "y2": 0.60,
+                    "label": f"{yolo_cls.upper()} ({yolo_conf:.2f})",
+                    "compliant": helmet_now,
+                }
+                self.hands_landmarks = []
+                if check_mid_ride and self.system_on:
+                    self.mid_ride_buffering = not helmet_now
+                elif helmet_now:
+                    self.mid_ride_buffering = False
+                if ok_enc and buf is not None:
+                    self._latest_jpeg = buf.tobytes()
+                    self._frame_seq += 1
+
+        return self.get_telemetry()
+
+    def _process_single_frame(
+        self, raw_frame: np.ndarray, source_label: str, check_mid_ride: bool = False
+    ) -> None:
+        frame = cv2.flip(raw_frame, 1)
+        fh, fw = frame.shape[:2]
+        frame_aspect = round(fw / max(1, fh), 4)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        face_found = False
+        helmet_now = False
+        yolo_cls = "none"
+        yolo_conf = 0.0
+        comp_status = "NO_HEAD"
+        comp_label = "NO RIDER HEAD DETECTED"
+        head_box_norm: Optional[Dict[str, object]] = None
+        hands_lms_payload: list = []
+        left_state = "NONE"
+        right_state = "NONE"
+
+        # 1. OpenCV Haar Face -> Head Box & Local YOLO Classification
+        head_box, head_pts = self._detect_head_box(frame, None)
+        if head_box is not None:
+            face_found = True
+            yolo_cls, yolo_conf = self._classify_head_yolo(frame, head_box)
+
+            with self._lock:
+                ov = self.helmet_override
+            if ov == "helmet":
+                yolo_cls, yolo_conf = "helmet", 0.96
+            elif ov == "special_case":
+                yolo_cls, yolo_conf = "special_case", 0.95
+            elif ov == "no_helmet":
+                yolo_cls, yolo_conf = "no_helmet", 0.95
+
+            if yolo_cls == "helmet" and yolo_conf >= 0.60:
+                helmet_now = True
+                comp_status, comp_label = "HELMET_VERIFIED", "HELMET DETECTED"
+                box_col, box_lbl = (80, 245, 140), f"HELMET ({yolo_conf:.2f})"
+            elif yolo_cls == "special_case" and yolo_conf >= 0.60:
+                helmet_now = True
+                comp_status, comp_label = "TURBAN_EXEMPT", "TURBAN / PAGRI EXEMPT"
+                box_col, box_lbl = (80, 245, 140), f"TURBAN ({yolo_conf:.2f})"
+            else:
+                helmet_now = False
+                comp_status, comp_label = "NO_HELMET", "NO HELMET DETECTED"
+                box_col, box_lbl = (65, 85, 255), f"NO HELMET ({yolo_conf:.2f})"
+
+            head_box_norm = {
+                "x1": round(head_box[0] / max(1, fw), 4),
+                "y1": round(head_box[1] / max(1, fh), 4),
+                "x2": round(head_box[2] / max(1, fw), 4),
+                "y2": round(head_box[3] / max(1, fh), 4),
+                "label": box_lbl,
+                "compliant": helmet_now,
+            }
+            self._draw_corner_box(frame, head_box, box_col, box_lbl)
+            for px, py in head_pts:
+                cv2.circle(frame, (px, py), 3, (0, 235, 255), -1)
+
+        # 2. MediaPipe Hands (21-point landmarks on snapshot)
+        hand_res = self._hands.process(rgb)
+        if hand_res.multi_hand_landmarks and hand_res.multi_handedness:
+            detected = []
+            for lms, handed in zip(
+                hand_res.multi_hand_landmarks, hand_res.multi_handedness
+            ):
+                label = handed.classification[0].label.upper()
+                wrist_x = lms.landmark[0].x
+                pose_lbl = self._classify_hand_pose(lms)
+                detected.append((wrist_x, label, lms, pose_lbl))
+
+            if len(detected) == 2:
+                detected.sort(key=lambda item: item[0])
+                detected[0] = (detected[0][0], "LEFT", detected[0][2], detected[0][3])
+                detected[1] = (detected[1][0], "RIGHT", detected[1][2], detected[1][3])
+
+            for _, side, lms, pose_lbl in detected:
+                if side == "LEFT":
+                    left_state = pose_lbl
+                else:
+                    right_state = pose_lbl
+                hands_lms_payload.append(
+                    {
+                        "side": side,
+                        "pose": pose_lbl,
+                        "points": [
+                            [round(pt.x, 3), round(pt.y, 3)] for pt in lms.landmark
+                        ],
+                    }
+                )
+                self._draw_hand_skeleton(frame, lms, side, pose_lbl)
+
+        display_frame = self._center_square_crop(frame, 360)
+        ok_enc, buf = cv2.imencode(
+            ".jpg", display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+        )
+
+        with self._lock:
+            self.camera_label = source_label
+            self.face_detected = face_found
+            self.helmet_detected = helmet_now
+            self.helmet_score = yolo_conf if helmet_now else (1.0 - yolo_conf)
+            self.yolo_class = yolo_cls
+            self.yolo_conf = yolo_conf
+            self.compliance_status = comp_status
+            self.compliance_label = comp_label
+            self.head_box_norm = head_box_norm
+            self.hands_landmarks = hands_lms_payload
+            self.frame_aspect = frame_aspect
+            self.left_hand_state = left_state
+            self.right_hand_state = right_state
+            if check_mid_ride and self.system_on:
+                self.mid_ride_buffering = not helmet_now
+                self.no_helmet_sustained_sec = 2.5 if not helmet_now else 0.0
+            elif helmet_now:
+                self.mid_ride_buffering = False
+                self.no_helmet_sustained_sec = 0.0
+            if ok_enc and buf is not None:
+                self._latest_jpeg = buf.tobytes()
+                self._frame_seq += 1
 
     def push_browser_frame(self, jpeg_bytes: bytes) -> bool:
         if not jpeg_bytes:
             return False
-        with self._lock:
-            self._browser_jpeg_raw = jpeg_bytes
-            self._browser_seq += 1
-            self._browser_frame_ts = time.monotonic()
-        self._browser_event.set()
+        self.analyze_snapshot(jpeg_bytes, check_mid_ride=False)
+        return True
+
+    def push_browser_frame_and_wait(self, jpeg_bytes: bytes, timeout: float = 0.35) -> bool:
+        if not jpeg_bytes:
+            return False
+        self.analyze_snapshot(jpeg_bytes, check_mid_ride=False)
         return True
 
     def retry_camera(self) -> bool:
@@ -314,6 +562,9 @@ class VisionTracker:
                 "cursor_active": self.cursor_active,
                 "cursor_x": round(self.cursor_x, 4),
                 "cursor_y": round(self.cursor_y, 4),
+                "head_box": self.head_box_norm,
+                "hands_landmarks": self.hands_landmarks,
+                "frame_aspect": self.frame_aspect,
                 "camera_available": self.camera_available or browser_live,
                 "camera_label": self.camera_label,
                 "fps": round(self.fps, 1),
@@ -410,8 +661,9 @@ class VisionTracker:
 
         # Refine/fallback with OpenCV Haar frontal face cascade
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        min_face = max(24, int(min(w, h) * 0.10))
         faces = self._face_cascade.detectMultiScale(
-            gray, scaleFactor=1.12, minNeighbors=5, minSize=(56, 56)
+            gray, scaleFactor=1.10, minNeighbors=4, minSize=(min_face, min_face)
         )
         if len(faces) > 0:
             fx, fy, fw, fh = max(faces, key=lambda b: b[2] * b[3])
@@ -448,8 +700,8 @@ class VisionTracker:
         # Fallback: if Haar missed (common for full-face helmets / visors / turbans),
         # inspect upper-center head region if scene has sufficient structure (non-blank wall).
         if pose_box is None:
-            ux1, uy1 = int(w * 0.18), int(h * 0.04)
-            ux2, uy2 = int(w * 0.82), int(h * 0.86)
+            ux1, uy1 = int(w * 0.24), int(h * 0.12)
+            ux2, uy2 = int(w * 0.76), int(h * 0.82)
             roi = gray[uy1:uy2, ux1:ux2]
             if roi.size > 0 and float(np.std(roi)) > 16.0:
                 pose_box = (ux1, uy1, ux2, uy2)
@@ -760,6 +1012,7 @@ class VisionTracker:
         last_t = time.perf_counter()
         fps_smooth = 15.0
         last_browser_seq = -1
+        black_frames = 0
 
         while self._running:
             if not self.camera_available:
@@ -778,6 +1031,10 @@ class VisionTracker:
             comp_label = "NO HELMET DETECTED"
             cursor_active = False
             raw_cursor_xy: Optional[Tuple[float, float]] = None
+            head_box_norm: Optional[Dict[str, object]] = None
+            hands_lms_payload: list = []
+            frame_aspect = 4.0 / 3.0
+            processed_seq_now: Optional[int] = None
 
             raw_frame = None
             using_live = False
@@ -786,11 +1043,22 @@ class VisionTracker:
             if self.camera_available and self._cap is not None:
                 ok, cam_frame = self._cap.read()
                 if ok and cam_frame is not None:
-                    raw_frame = cam_frame
-                    using_live = True
+                    if float(cam_frame.mean()) < 2.0 and float(cam_frame.std()) < 2.0:
+                        black_frames += 1
+                        if black_frames >= 12:
+                            print("[VisionTracker] OpenCV camera returning black frames; releasing for Browser Cam fallback")
+                            self._cap.release()
+                            self._cap = None
+                            self.camera_available = False
+                            self.camera_label = "BROWSER / CLOUD CAM"
+                            black_frames = 0
+                    else:
+                        black_frames = 0
+                        raw_frame = cam_frame
+                        using_live = True
                 else:
                     self.camera_available = False
-                    self.camera_label = "DEMO MODE (WEBCAM LOST)"
+                    self.camera_label = "BROWSER / CLOUD CAM"
             else:
                 with self._lock:
                     b_seq = self._browser_seq
@@ -812,6 +1080,7 @@ class VisionTracker:
                     if raw_frame is not None:
                         using_live = True
                         is_browser_cam = True
+                        processed_seq_now = b_seq
                         self.camera_label = "LIVE BROWSER CAM"
 
             dt = max(0.001, min(1.5, now - last_t))
@@ -821,6 +1090,8 @@ class VisionTracker:
             if using_live and raw_frame is not None:
                 # Mirror selfie frame for intuitive PiP & steering
                 frame = cv2.flip(raw_frame, 1)
+                fh, fw = frame.shape[:2]
+                frame_aspect = round(fw / max(1, fh), 4)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 # 1. OpenCV Haar Face -> Head Box & Local YOLO Classification
@@ -864,6 +1135,14 @@ class VisionTracker:
                     self._helmet_ema = 0.75 * self._helmet_ema + 0.25 * (
                         yolo_conf if helmet_now else (1.0 - yolo_conf)
                     )
+                    head_box_norm = {
+                        "x1": round(head_box[0] / max(1, fw), 4),
+                        "y1": round(head_box[1] / max(1, fh), 4),
+                        "x2": round(head_box[2] / max(1, fw), 4),
+                        "y2": round(head_box[3] / max(1, fh), 4),
+                        "label": box_lbl,
+                        "compliant": helmet_now,
+                    }
                     self._draw_corner_box(frame, head_box, box_col, box_lbl)
                     for px, py in head_pts:
                         cv2.circle(frame, (px, py), 3, (0, 235, 255), -1)
@@ -907,6 +1186,16 @@ class VisionTracker:
                             left_state = pose_lbl
                         else:
                             right_state = pose_lbl
+                        hands_lms_payload.append(
+                            {
+                                "side": side,
+                                "pose": pose_lbl,
+                                "points": [
+                                    [round(pt.x, 3), round(pt.y, 3)]
+                                    for pt in lms.landmark
+                                ],
+                            }
+                        )
                         self._draw_hand_skeleton(frame, lms, side, pose_lbl)
                         if pose_lbl == "INDEX_ONLY" and raw_cursor_xy is None:
                             tip = lms.landmark[8]
@@ -1016,10 +1305,18 @@ class VisionTracker:
                 self.cursor_active = cursor_active
                 self.cursor_x = self._cursor_x_ema
                 self.cursor_y = self._cursor_y_ema
+                self.head_box_norm = head_box_norm
+                self.hands_landmarks = hands_lms_payload
+                self.frame_aspect = frame_aspect
                 self.fps = fps_smooth
+                if processed_seq_now is not None:
+                    self._processed_browser_seq = processed_seq_now
                 if ok_enc and buf is not None:
                     self._latest_jpeg = buf.tobytes()
                     self._frame_seq += 1
+
+            if processed_seq_now is not None:
+                self._processed_event.set()
 
             if self.camera_available:
                 time.sleep(0.02)

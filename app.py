@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 from contextlib import asynccontextmanager
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -33,6 +35,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 class ToggleRequest(BaseModel):
     state: Optional[bool] = None
+    image_b64: Optional[str] = None
+
+
+class ComplianceScanRequest(BaseModel):
+    image_b64: Optional[str] = None
 
 
 class HelmetOverrideRequest(BaseModel):
@@ -65,11 +72,33 @@ async def get_state():
     return JSONResponse(tracker.get_telemetry())
 
 
+def _decode_b64_image(image_b64: Optional[str]) -> Optional[bytes]:
+    if not image_b64:
+        return None
+    raw = image_b64.split(",", 1)[-1]
+    try:
+        return base64.b64decode(raw)
+    except Exception:
+        return None
+
+
 @app.post("/api/toggle")
 async def toggle_system(body: Optional[ToggleRequest] = None):
     target = body.state if body is not None else None
+    want_on = (not tracker.system_on) if target is None else bool(target)
+    if want_on:
+        jpg_bytes = _decode_b64_image(body.image_b64 if body is not None else None)
+        await run_in_threadpool(tracker.analyze_snapshot, jpg_bytes, False)
     result = tracker.attempt_ignite(target)
+    result["telemetry"] = tracker.get_telemetry()
     return JSONResponse(result)
+
+
+@app.post("/api/compliance_scan")
+async def compliance_scan(body: Optional[ComplianceScanRequest] = None):
+    jpg_bytes = _decode_b64_image(body.image_b64 if body is not None else None)
+    telemetry = await run_in_threadpool(tracker.analyze_snapshot, jpg_bytes, True)
+    return JSONResponse({"ok": True, "telemetry": telemetry})
 
 
 @app.post("/api/helmet_override")
@@ -97,8 +126,8 @@ async def retry_camera():
 @app.post("/api/upload_frame")
 async def upload_frame(request: Request):
     data = await request.body()
-    ok = tracker.push_browser_frame(data)
-    return JSONResponse({"ok": ok})
+    ok = await run_in_threadpool(tracker.push_browser_frame_and_wait, data, 1.2)
+    return JSONResponse({"ok": ok, "telemetry": tracker.get_telemetry()})
 
 
 @app.get("/video_feed")

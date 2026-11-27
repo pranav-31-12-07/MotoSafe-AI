@@ -1,14 +1,18 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MotoSafe AI — Helmet Safety &amp; Gesture Riding Simulator</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800&family=Orbitron:wght@600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800&family=Orbitron:wght@600;700;800&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=4" />
 </head>
+
 <body>
   <div id="app">
     <!-- Fullscreen 3-Lane Road + Traffic + Motorcycle POV Cockpit Canvas -->
@@ -76,6 +80,7 @@
     <div class="pip-wrapper">
       <div id="pipFrame" class="pip-circle">
         <img id="pipStream" src="/video_feed" alt="Live MediaPipe Selfie Feed" />
+        <canvas id="pipOverlay" class="pip-overlay" width="240" height="240"></canvas>
       </div>
       <div class="pip-telemetry">
         <span id="leftHandBadge" class="hand-chip">L: NONE</span>
@@ -122,6 +127,8 @@
     </div>
   </div>
 
-  <script type="module" src="/static/app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script type="module" src="/static/app.js?v=4"></script>
 </body>
+
 </html>

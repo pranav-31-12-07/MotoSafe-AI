@@ -419,6 +419,7 @@ body {
 }
 
 .pip-circle {
+  position: relative;
   width: 182px;
   height: 182px;
   border-radius: 50%;
@@ -427,6 +428,16 @@ body {
   background: #141a22;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
   transition: border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+.pip-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 10;
 }
 
 .pip-circle.is-safe {
