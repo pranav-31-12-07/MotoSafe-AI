@@ -215,40 +215,68 @@ async function startBrowserCam() {
   if (browserCamStream || !navigator.mediaDevices?.getUserMedia) return;
   try {
     browserCamStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480, facingMode: "user" },
+      video: { width: 480, height: 360, facingMode: "user" },
       audio: false,
     });
-    const hiddenVideo = document.createElement("video");
-    hiddenVideo.srcObject = browserCamStream;
-    hiddenVideo.muted = true;
-    await hiddenVideo.play();
+
+    // Attach live mirrored video directly inside pipFrame so your face shows at 60 FPS
+    const liveVideo = document.createElement("video");
+    liveVideo.srcObject = browserCamStream;
+    liveVideo.muted = true;
+    liveVideo.playsInline = true;
+    liveVideo.autoplay = true;
+    Object.assign(liveVideo.style, {
+      position: "absolute",
+      inset: "0",
+      width: "100%",
+      height: "100%",
+      objectFit: "cover",
+      transform: "scaleX(-1)",
+      borderRadius: "50%",
+      zIndex: "5",
+    });
+
+    // Hide any placeholder img/canvas inside pipFrame and mount liveVideo
+    Array.from(pipFrame.children).forEach((el) => {
+      el.style.display = "none";
+    });
+    pipFrame.style.position = "relative";
+    pipFrame.appendChild(liveVideo);
+    await liveVideo.play();
 
     const capCanvas = document.createElement("canvas");
-    capCanvas.width = 480;
-    capCanvas.height = 360;
+    capCanvas.width = 320;
+    capCanvas.height = 240;
     const capCtx = capCanvas.getContext("2d");
 
     browserCamBtn.textContent = "Browser Cam Active";
+
+    // Single-flight upload loop (prevents 502 overload on Render's 0.1 CPU)
+    let uploadInFlight = false;
     setInterval(() => {
-      if (!browserCamStream) return;
-      capCtx.drawImage(hiddenVideo, 0, 0, capCanvas.width, capCanvas.height);
+      if (!browserCamStream || uploadInFlight) return;
+      uploadInFlight = true;
+      capCtx.drawImage(liveVideo, 0, 0, capCanvas.width, capCanvas.height);
       capCanvas.toBlob(
         async (blob) => {
-          if (!blob) return;
           try {
-            await fetch("/api/upload_frame", {
-              method: "POST",
-              headers: { "Content-Type": "image/jpeg" },
-              body: blob,
-            });
+            if (blob) {
+              await fetch("/api/upload_frame", {
+                method: "POST",
+                headers: { "Content-Type": "image/jpeg" },
+                body: blob,
+              });
+            }
           } catch (_) {
-            // ignore transient frame upload errors
+            // ignore transient network errors
+          } finally {
+            uploadInFlight = false;
           }
         },
         "image/jpeg",
-        0.75
+        0.65
       );
-    }, 66);
+    }, 350);
   } catch (err) {
     camStatusPill.textContent = "Browser cam denied/unavailable";
     console.error("Browser cam error:", err);
