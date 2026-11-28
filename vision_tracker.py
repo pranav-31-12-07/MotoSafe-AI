@@ -10,10 +10,14 @@ from typing import Dict, Optional, Tuple, Union
 import cv2
 import mediapipe as mp
 import numpy as np
+from PIL import Image
 import torch
-from ultralytics import YOLO
 
-from train_model import ensure_trained_model
+from train_model import (
+    ensure_linear_classifier,
+    load_linear_classifier,
+    predict_linear_probs,
+)
 
 cv2.setNumThreads(1)
 try:
@@ -92,10 +96,10 @@ class VisionTracker:
         self._last_yolo_res: Tuple[str, float] = ("none", 0.0)
         self._last_demo_key: Optional[Tuple[object, ...]] = None
 
-        # Local Ultralytics YOLO helmet/turban classifier (auto-trains best.pt if missing)
-        weights_path = ensure_trained_model()
-        self._yolo_model = YOLO(str(weights_path))
-        print(f"[VisionTracker] Loaded YOLO classifier: {weights_path}")
+        # Frozen EfficientNet-B0 feature extractor + balanced linear classifier (auto-trains if missing)
+        weights_path = ensure_linear_classifier()
+        self._eff_backbone, self._eff_head, self._cls_names = load_linear_classifier(weights_path)
+        print(f"[VisionTracker] Loaded frozen-backbone linear classifier: {weights_path}")
 
         # MediaPipe Hands (model_complexity=0 keeps RAM & CPU low for cloud/edge) & OpenCV Haar
         self._mp_hands = mp.solutions.hands
@@ -112,12 +116,11 @@ class VisionTracker:
         self._face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
-        # Warm up YOLO & MediaPipe once at boot so first live frame is fast
+        # Warm up classifier & MediaPipe once at boot so first live frame is fast
         try:
-            dummy = np.zeros((224, 224, 3), dtype=np.uint8)
-            with torch.no_grad():
-                self._yolo_model(dummy, imgsz=224, verbose=False)
-            self._hands.process(dummy)
+            dummy_rgb = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
+            predict_linear_probs(self._eff_backbone, self._eff_head, [dummy_rgb])
+            self._hands.process(np.zeros((224, 224, 3), dtype=np.uint8))
         except Exception:
             pass
         gc.collect()
@@ -711,7 +714,7 @@ class VisionTracker:
     def _classify_head_yolo(
         self, frame: np.ndarray, head_box: Tuple[int, int, int, int]
     ) -> Tuple[str, float]:
-        """Run local Ultralytics YOLO classification on the padded head crop."""
+        """Run frozen EfficientNet-B0 + balanced linear classifier on full-frame + padded head crop."""
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = head_box
         bw = x2 - x1
@@ -719,20 +722,24 @@ class VisionTracker:
         if bw < 28 or bh < 28:
             return "none", 0.0
 
-        # Pad upward/sideways to capture full helmet dome or turban/pagri crown
-        cx1 = max(0, x1 - int(bw * 0.14))
-        cy1 = max(0, y1 - int(bh * 0.22))
-        cx2 = min(w, x2 + int(bw * 0.14))
-        cy2 = min(h, y2 + int(bh * 0.06))
+        # Pad generously upward/sideways to capture full front-view helmet shell & straps
+        cx1 = max(0, x1 - int(bw * 0.28))
+        cy1 = max(0, y1 - int(bh * 0.32))
+        cx2 = min(w, x2 + int(bw * 0.28))
+        cy2 = min(h, y2 + int(bh * 0.16))
         crop = frame[cy1:cy2, cx1:cx2]
         if crop.size == 0:
             return "none", 0.0
 
-        with torch.no_grad():
-            res = self._yolo_model(crop, imgsz=224, verbose=False)[0]
-        pred_idx = int(res.probs.top1)
-        pred_cls = str(res.names[pred_idx])
-        conf = float(res.probs.top1conf)
+        pil_full = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        pil_crop = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        probs_batch = predict_linear_probs(
+            self._eff_backbone, self._eff_head, [pil_full, pil_crop]
+        )
+        probs = 0.55 * probs_batch[0] + 0.45 * probs_batch[1]
+        pred_idx = int(probs.argmax().item())
+        pred_cls = str(self._cls_names[pred_idx])
+        conf = float(probs[pred_idx].item())
         return pred_cls, conf
 
     def _estimate_helmet_score(

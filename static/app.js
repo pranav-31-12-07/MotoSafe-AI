@@ -73,9 +73,9 @@ let telemetry = {
 let alertOverride = null; // { type: 'danger'|'safe', title: string, sub: string, untilMs: number }
 let audioCtx = null;
 
-// 1-minute (60s) periodic compliance scan timer + Demo 10x Speed toggle
+// 30-second periodic compliance scan timer + Demo 10x Speed toggle
 let demoFastScan = false;
-let scanRemainingSec = 60;
+let scanRemainingSec = 30;
 let scanViolationBuffering = false;
 
 // Smooth screen-space cursor position & ignition-button dwell state
@@ -207,7 +207,7 @@ async function toggleIgnition(clearDemoIndex = false) {
         4500
       );
     } else if (telemetry.system_on) {
-      scanRemainingSec = demoFastScan ? 10 : 60;
+      scanRemainingSec = demoFastScan ? 10 : 30;
       scanViolationBuffering = false;
       const isTurban = data.compliance_status === "TURBAN_EXEMPT";
       setBannerAlert(
@@ -239,12 +239,12 @@ async function toggleIgnition(clearDemoIndex = false) {
 // Toggle IGNITE via mouse click
 onOffBtn.addEventListener("click", () => toggleIgnition(false));
 
-// Toggle DEMO 10x SPEED (switches 60s scan cycle to 10s for live judging)
+// Toggle DEMO 10x SPEED (switches 30s scan cycle to 10s for live judging)
 demoSpeedBtn.addEventListener("click", () => {
   demoFastScan = !demoFastScan;
   demoSpeedBtn.classList.toggle("is-active", demoFastScan);
   demoSpeedBtn.setAttribute("aria-pressed", String(demoFastScan));
-  scanRemainingSec = demoFastScan ? Math.min(scanRemainingSec, 10) : 60;
+  scanRemainingSec = demoFastScan ? Math.min(scanRemainingSec, 10) : 30;
   updateScanTimerDisplay();
 });
 
@@ -297,7 +297,7 @@ async function startBrowserCam() {
     liveVideoEl = liveVideo;
 
     browserCamBtn.textContent = "Browser Cam Active";
-    camStatusPill.textContent = "LIVE HANDS • YOLO SNAPSHOT ON IGNITE & 1-MIN";
+    camStatusPill.textContent = "LIVE HANDS • SNAPSHOT ON IGNITE & 30-SEC";
     startBrowserHandTracker(liveVideo);
   } catch (err) {
     camStatusPill.textContent = "Browser cam denied/unavailable";
@@ -500,7 +500,7 @@ function updateScanTimerDisplay() {
   const totalSec = Math.max(0, Math.ceil(scanRemainingSec));
   const mins = String(Math.floor(totalSec / 60)).padStart(2, "0");
   const secs = String(totalSec % 60).padStart(2, "0");
-  scanTimerText.textContent = `NEXT 1-MIN SCAN: ${mins}:${secs}`;
+  scanTimerText.textContent = `NEXT 30-SEC SCAN: ${mins}:${secs}`;
 }
 
 async function runPeriodicComplianceScan() {
@@ -523,7 +523,7 @@ async function runPeriodicComplianceScan() {
       scanViolationBuffering = false;
       setBannerAlert(
         "safe",
-        "1-MIN COMPLIANCE SCAN: PASSED ✔",
+        "30-SEC COMPLIANCE SCAN: PASSED ✔",
         `${telemetry.compliance_label} (${Math.round((telemetry.yolo_conf || 0) * 100)}%) • FULL THROTTLE MAINTAINED`,
         3000
       );
@@ -533,7 +533,7 @@ async function runPeriodicComplianceScan() {
       setBannerAlert(
         "danger",
         "HELMET REMOVED - PROGRESSIVE SPEED BUFFERING",
-        "1-MIN SCAN VIOLATION • DECELERATING TO 20 KM/H SAFETY CAP",
+        "30-SEC SCAN VIOLATION • DECELERATING TO 20 KM/H SAFETY CAP",
         4000
       );
     }
@@ -547,7 +547,7 @@ async function runPeriodicComplianceScan() {
 
 function updatePeriodicScan(dt) {
   if (!telemetry.system_on) {
-    scanRemainingSec = demoFastScan ? 10 : 60;
+    scanRemainingSec = demoFastScan ? 10 : 30;
     scanViolationBuffering = false;
     updateScanTimerDisplay();
     return;
@@ -555,7 +555,7 @@ function updatePeriodicScan(dt) {
 
   scanRemainingSec -= dt;
   if (scanRemainingSec <= 0) {
-    scanRemainingSec = demoFastScan ? 10 : 60;
+    scanRemainingSec = demoFastScan ? 10 : 30;
     runPeriodicComplianceScan();
   }
   updateScanTimerDisplay();
